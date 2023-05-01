@@ -8,11 +8,13 @@
 #define SERVICE_UUID        "307ba605-b5bf-437a-8f70-87fff5eb5f48"
 #define CHARACTERISTIC_UUID "4a5d39f9-256d-4fa0-9afb-97e61afb86fa"
 
-#define LED 32
 #define SAMP_RATE 1
 #define BLE_SCAN_RATE 500
 #define OUT_RANGE_COUNT_THRESHOLD 3
-#define SIGNAL_STRENGTH_THRESHOLD -80
+#define SIGNAL_STRENGTH_THRESHOLD -65
+#define BUZZ_PIN 32
+#define BUZZ_TIME 250
+#define BUZZ_FREQ 0.5
 
 LSM6DSO myIMU;
 TFT_eSPI tft = TFT_eSPI();
@@ -26,6 +28,32 @@ float prevVelY;
 float prevT;
 float rssiTimer;
 float outRangeCount;
+
+// buzzer vars
+float buzzTimer;
+bool buzzerOn;
+float freqBuzz;
+bool buzz;
+
+void buzzerActivate() {
+  if(millis() > buzzTimer) {
+    buzzTimer = millis() + BUZZ_TIME;
+    buzzerOn = !buzzerOn;
+  }
+  if(buzzerOn) {
+    if(millis() > freqBuzz) {
+      freqBuzz = millis() + BUZZ_FREQ;
+      buzz = !buzz;
+    }
+    if(buzz) {
+      digitalWrite(BUZZ_PIN, HIGH);
+    } else {
+      digitalWrite(BUZZ_PIN, LOW);
+    }
+  } else {
+    digitalWrite(BUZZ_PIN, LOW);
+  }
+}
 
 void updateVel(float dt, float accY) {
   //calculate velocity in y direction
@@ -56,7 +84,7 @@ void updatePos(float dt, float velY) {
 void setup() {
   Serial.begin(9600);
   Serial.println();
-  pinMode(LED, OUTPUT);
+  pinMode(BUZZ_PIN, OUTPUT);
 
   // setup BLE
   if (!BLE.begin()) {
@@ -128,12 +156,19 @@ void setup() {
   Serial.printf("acceleration z bias: %.2f\n", p.biasZ);
   prevT = millis()/1000.0;
 
+  // init buzzer
+  pinMode(BUZZ_PIN, OUTPUT);
+  buzzTimer = millis() + BUZZ_TIME;
+  buzzerOn = false;
+  freqBuzz = millis();
+  buzz = false;
+  digitalWrite(BUZZ_PIN, LOW);
 }
 
 void loop() {
   // wait until ble connection established
   while(!central.connected()){
-    digitalWrite(LED, LOW);
+    digitalWrite(BUZZ_PIN, LOW);
     central = BLE.central();
     Serial.println("Waiting for BLE connection...");
     delay(BLE_SCAN_RATE);
@@ -149,7 +184,7 @@ void loop() {
     calAccY = 0;
   }
 
-  // get RSSI value
+  // get RSSI value & count weak signal strength instances
   if(central) {
     if(time > rssiTimer && central.connected()){
       int rssi = BLE.rssi();
@@ -160,14 +195,14 @@ void loop() {
       } else {
         outRangeCount = 0;
       }
-      // if phone was out of range consistently, buzz buzzer
-      if(outRangeCount >= OUT_RANGE_COUNT_THRESHOLD) {
-        digitalWrite(LED, HIGH);
-      } else {
-        digitalWrite(LED, LOW);
-      }
       rssiTimer = time + BLE_SCAN_RATE;
     }
+  }
+  // if phone was out of range consistently, buzz buzzer
+  if(outRangeCount >= OUT_RANGE_COUNT_THRESHOLD) {
+    buzzerActivate();
+  } else {
+    digitalWrite(BUZZ_PIN, LOW);
   }
 
   // update pose values

@@ -8,12 +8,13 @@
 #include <ArduinoBLE.h>
 #include <string>
 
+
 #define SERVICE_UUID        "307ba605-b5bf-437a-8f70-87fff5eb5f48"
 #define CHARACTERISTIC_UUID "4a5d39f9-256d-4fa0-9afb-97e61afb86fa"
 
 #define SAMP_RATE 1
 #define BLE_SCAN_RATE 500
-#define OUT_RANGE_COUNT_THRESHOLD 3
+#define OUT_RANGE_COUNT_THRESHOLD 5
 #define SIGNAL_STRENGTH_THRESHOLD -65
 #define BUZZ_PIN 32
 #define BUZZ_TIME 250
@@ -23,20 +24,21 @@
 LSM6DSO myIMU;
 TFT_eSPI tft = TFT_eSPI();
 IMU_Vals p;
-BLEService batteryService(SERVICE_UUID);
-BLEUnsignedCharCharacteristic batteryLevelChar(CHARACTERISTIC_UUID, BLERead | BLENotify);
+BLEService service(SERVICE_UUID);
+BLEUnsignedCharCharacteristic characteristic(CHARACTERISTIC_UUID, BLERead | BLENotify);
 BLEDevice central;
 
 // wifi vars
 char ssid[] = "Tell my wifi love her";
 char pass[] = "hmmmmmmm";
-const char kHostname[] = "3.101.68.31";
-std::string kPath;
+const char kHostname[] = "54.215.244.83";
 const int kNetworkDelay = 1000;
-float netAttemptTimer;
 WiFiClient c;
 HttpClient http(c);
-std::string bleConnectionStatus = "true";
+
+bool bleConnected;
+bool blePrevConnected;
+float bleScanTimer;
 
 // imu pose vars
 float prevCalAccY;
@@ -97,6 +99,18 @@ void updatePos(float dt, float velY) {
   }
 }
 
+void updatePose(float currTime) {
+  float dt = currTime/1000.0 - prevT;
+  float calAccY = (myIMU.readFloatAccelY() - p.biasY) * G;
+  if(calAccY < 0.07 && calAccY > -0.07) {
+    calAccY = 0;
+  }
+  updateVel(dt, calAccY);
+  updatePos(dt, p.vy);
+  prevVelY = p.vy;
+  prevCalAccY = calAccY;
+}
+
 void send(std::string kPath) {
   int err = 0;
   WiFiClient c;
@@ -117,7 +131,6 @@ void send(std::string kPath) {
     Serial.println(err);
   }
   http.stop();
-  netAttemptTimer = millis() + kNetworkDelay;
 }
 
 void sendBLEConnectionStatus(std::string connectionStatus) {
@@ -142,14 +155,16 @@ void setup() {
     while (1);
   }
   BLE.setLocalName("KOAT Device");
-  BLE.setAdvertisedService(batteryService);
-  batteryService.addCharacteristic(batteryLevelChar);
-  BLE.addService(batteryService);
+  BLE.setAdvertisedService(service);
+  service.addCharacteristic(characteristic);
+  BLE.addService(service);
   BLE.advertise();
   central = BLE.central();
   Serial.println("Bluetooth device active, waiting for connections...");
   rssiTimer = millis() + BLE_SCAN_RATE;
   outRangeCount = 0;
+  bleConnected = false;
+  blePrevConnected = false;
 
   // setup wifi
   delay(kNetworkDelay);
@@ -165,6 +180,7 @@ void setup() {
   Serial.println(WiFi.localIP());
   Serial.println("MAC address: ");
   Serial.println(WiFi.macAddress());
+  sendBLEConnectionStatus("false");
 
   // init IMU
   Serial.println("Initializing IMU...");
@@ -227,66 +243,60 @@ void setup() {
   buzzerOn = false;
   freqBuzz = millis();
   buzz = false;
-  digitalWrite(BUZZ_PIN, LOW);
 }
 
 void loop() {
-  // wait until ble connection established
-  while(!central.connected()){
-    digitalWrite(BUZZ_PIN, LOW);
+  // first check if board is connected
+  if(central) {
+    if(central.connected()) {
+      bleConnected = true;
+    } else {
+      Serial.println("central disconnected: connected false");
+      bleConnected = false;
+    }
+  } else if (millis() > bleScanTimer){
+    Serial.println("central not found: connected false");
+    bleConnected = false;
     central = BLE.central();
-    sendConnectionStatus("false");
-    delay(BLE_SCAN_RATE);
+    bleScanTimer = millis() + BLE_SCAN_RATE;
+    digitalWrite(BUZZ_PIN, LOW);
   }
 
-  float time = millis();
-  // delta time of current measurement and previous measurement
-  float dt = time/1000.0 - prevT;
-  // current calibrated acceleration x
-  float calAccY = (myIMU.readFloatAccelY() - p.biasY) * G;
-  // if the measured values are small enough just set acc to 0
-  if(calAccY < 0.07 && calAccY > -0.07) {
-    calAccY = 0;
-  }
+  float currTime = millis();
 
   // get RSSI value & count weak signal strength instances
-  if(central) {
-    if(time > rssiTimer && central.connected()){
-      int rssi = BLE.rssi();
-      //Serial.printf("RSSI val: %d\n", rssi);
-      // if phone is out of range, count
-      if(rssi < SIGNAL_STRENGTH_THRESHOLD) {
-        outRangeCount++;
-      } else {
-        outRangeCount = 0;
-      }
-      rssiTimer = time + BLE_SCAN_RATE;
+  if(bleConnected && currTime > rssiTimer) {
+    int rssi = BLE.rssi();
+    Serial.printf("RSSI val: %d\n", rssi);
+    // if phone is out of range, count
+    if(rssi < SIGNAL_STRENGTH_THRESHOLD) {
+      outRangeCount++;
+    } else {
+      outRangeCount = 0;
     }
-  }
-  // if phone was out of range consistently, buzz buzzer
-  if(outRangeCount >= OUT_RANGE_COUNT_THRESHOLD) {
-    buzzerActivate();
-    bleConnectionStatus = "false";
-    updateVel();
-    updatePos();
-    sendPosition(p.x, p.y, p.z);
-  } else {
-    digitalWrite(BUZZ_PIN, LOW);
-    bleConnectionStatus = "true";
+    rssiTimer = currTime + BLE_SCAN_RATE;
   }
 
-  // update pose values
-  updateVel(dt, calAccY);
-  updatePos(dt, p.vy);
+  // if phone was out of range consistently, buzz buzzer
+  if(outRangeCount >= OUT_RANGE_COUNT_THRESHOLD) {
+    Serial.println("out of range: connected false");
+    buzzerActivate();
+    bleConnected = false;
+    updatePose(currTime);
+    //sendPosition(p.x, p.y, p.z);
+  } else {
+    digitalWrite(BUZZ_PIN, LOW);
+  }
+
+  if(blePrevConnected && !bleConnected) {
+    sendBLEConnectionStatus("false");
+  } else if(bleConnected && !blePrevConnected) {
+    sendBLEConnectionStatus("true");
+  }
   
-  prevVelY = p.vy;
-  prevCalAccY = calAccY;
-  prevT = time/1000.0;
+  blePrevConnected = bleConnected;
+  prevT = currTime/1000.0;
   // Serial.printf("acc: %.2f m/s^2 | vel: %.3f m/s | pos: %.2f cm\n", calAccY, p.vy, p.y*100);
   //byte font = 6;
   //tft.drawFloat(p.vy, 0, 60, font);
-
-  if(millis() > netAttemptTimer) {
-    sendBLEConnectionStatus(bleConnectionStatus);
-  }
 }

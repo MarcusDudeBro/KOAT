@@ -1,12 +1,11 @@
 #include <Arduino.h>
-#include <TFT_eSPI.h>
 #include <WiFi.h>
-#include <HttpClient.h>
 #include "Wire.h"
 #include "SparkFunLSM6DSO.h"
 #include "../include/imu.h"
 #include <ArduinoBLE.h>
 #include <string>
+#include <AsyncHTTPRequest_Generic.h>
 
 
 #define SERVICE_UUID        "307ba605-b5bf-437a-8f70-87fff5eb5f48"
@@ -15,14 +14,13 @@
 #define SAMP_RATE 1
 #define BLE_SCAN_RATE 500
 #define OUT_RANGE_COUNT_THRESHOLD 5
-#define SIGNAL_STRENGTH_THRESHOLD -65
+#define SIGNAL_STRENGTH_THRESHOLD -55
 #define BUZZ_PIN 32
 #define BUZZ_TIME 250
 #define BUZZ_FREQ 0.5
 #define WIFI_SEARCH_DELAY 1000
 
 LSM6DSO myIMU;
-TFT_eSPI tft = TFT_eSPI();
 IMU_Vals p;
 BLEService service(SERVICE_UUID);
 BLEUnsignedCharCharacteristic characteristic(CHARACTERISTIC_UUID, BLERead | BLENotify);
@@ -31,10 +29,9 @@ BLEDevice central;
 // wifi vars
 char ssid[] = "Tell my wifi love her";
 char pass[] = "hmmmmmmm";
-const char kHostname[] = "54.215.244.83";
+const char kHostname[] = "54.215.244.83:5000";
 const int kNetworkDelay = 1000;
-WiFiClient c;
-HttpClient http(c);
+AsyncHTTPRequest request;
 
 bool bleConnected;
 bool blePrevConnected;
@@ -42,16 +39,18 @@ float bleScanTimer;
 
 // imu pose vars
 float prevCalAccY;
+float prevCalAccX;
 float prevVelY;
+float prevVelX;
 float prevT;
 float rssiTimer;
 float outRangeCount;
+float driftYCount;
+float driftXCount;
 
 // buzzer vars
 float buzzTimer;
 bool buzzerOn;
-float freqBuzz;
-bool buzz;
 
 void buzzerActivate() {
   if(millis() > buzzTimer) {
@@ -59,21 +58,13 @@ void buzzerActivate() {
     buzzerOn = !buzzerOn;
   }
   if(buzzerOn) {
-    if(millis() > freqBuzz) {
-      freqBuzz = millis() + BUZZ_FREQ;
-      buzz = !buzz;
-    }
-    if(buzz) {
-      digitalWrite(BUZZ_PIN, HIGH);
-    } else {
-      digitalWrite(BUZZ_PIN, LOW);
-    }
+    digitalWrite(BUZZ_PIN, HIGH);
   } else {
     digitalWrite(BUZZ_PIN, LOW);
   }
 }
 
-void updateVel(float dt, float accY) {
+void updateVel(float dt, float accY, float accX) {
   //calculate velocity in y direction
   if(prevCalAccY < accY) {
     p.vy += dt*(accY-prevCalAccY)/2.0 + prevCalAccY*dt;
@@ -82,13 +73,36 @@ void updateVel(float dt, float accY) {
   } else {
     p.vy += prevCalAccY*dt;
   }
-  // if velocity is small enough, just set it to 0
-  if(p.vy < 0.02 && p.vy > -0.02) {
+  // remove drift
+  if(abs(p.vy - prevVelY) < DRIFT_THRESH) {
+    driftYCount++;
+  } else {
+    driftYCount = 0;
+  }
+  if(driftYCount > MAX_DRIFT_COUNT) {
     p.vy = 0;
+  }
+  
+  //calculate velocity in x direction
+  if(prevCalAccX < accX) {
+    p.vx += dt*(accX-prevCalAccX)/2.0 + prevCalAccX*dt;
+  } else if(prevCalAccX > accX) {
+    p.vx += dt*(prevCalAccX-accX)/2.0 + accX*dt;
+  } else {
+    p.vx += prevCalAccX*dt;
+  }
+  // remove drift
+  if(abs(p.vx - prevVelX) < DRIFT_THRESH) {
+    driftXCount++;
+  } else {
+    driftXCount = 0;
+  }
+  if(driftXCount > MAX_DRIFT_COUNT) {
+    p.vx = 0;
   }
 }
 
-void updatePos(float dt, float velY) {
+void updatePos(float dt, float velY, float velX) {
   //calculate position in y direction
   if(prevVelY < velY) {
     p.y += dt*(velY-prevVelY)/2.0 + prevVelY*dt;
@@ -97,51 +111,61 @@ void updatePos(float dt, float velY) {
   } else {
     p.y += prevVelY*dt;
   }
+
+  //calculate position in x direction
+  if(prevVelX < velX) {
+    p.x += dt*(velX-prevVelX)/2.0 + prevVelX*dt;
+  } else if(prevVelX > velX) {
+    p.x += dt*(prevVelX-velX)/2.0 + velX*dt;
+  } else {
+    p.x += prevVelX*dt;
+  }
 }
 
 void updatePose(float currTime) {
   float dt = currTime/1000.0 - prevT;
   float calAccY = (myIMU.readFloatAccelY() - p.biasY) * G;
+  float calAccX = (myIMU.readFloatAccelX() - p.biasX) * G;
   if(calAccY < 0.07 && calAccY > -0.07) {
     calAccY = 0;
   }
-  updateVel(dt, calAccY);
-  updatePos(dt, p.vy);
+  if(calAccX < 0.07 && calAccX > -0.07) {
+    calAccX = 0;
+  }
+  updateVel(dt, calAccY, calAccX);
+  updatePos(dt, p.vy, p.vx);
   prevVelY = p.vy;
   prevCalAccY = calAccY;
+  prevVelX = p.vx;
+  prevCalAccX = calAccX;
+  Serial.printf("pos x: %.2f | pos y: %.2f\n", p.x, p.y);
+  //Serial.printf("acc: %.2f m/s^2 | vel: %.3f m/s | pos: %.2f cm\n", calAccY, p.vy, p.y*100);
 }
 
-void send(std::string kPath) {
-  int err = 0;
-  WiFiClient c;
-  http = HttpClient(c);
-  err = http.put(kHostname, 5000, kPath.c_str());
-  if (err == 0) {
-    Serial.println("startedRequest ok");
-    err = http.responseStatusCode();
-    if (err >= 0) {
-      Serial.print("Got status code: ");
-      Serial.println(err);
-    } else {    
-      Serial.print("Getting response failed: ");
-      Serial.println(err);
+void sendRequest(std::string kPath) {
+  delay(200);
+  static bool requestOpenResult;
+  if (request.readyState() == readyStateUnsent || request.readyState() == readyStateDone) {
+    requestOpenResult = request.open("PUT", (kHostname + kPath).c_str());
+    if (requestOpenResult) {
+      // Only send() if open() returns true, or crash
+      request.send();
+    } else {
+      Serial.println("Can't send, bad request");
     }
   } else {
-    Serial.print("Connect failed: ");
-    Serial.println(err);
+    Serial.println("Can't send request");
   }
-  http.stop();
 }
 
 void sendBLEConnectionStatus(std::string connectionStatus) {
   std::string kPath = "/connection?connected=" + connectionStatus;
-  send(kPath);
+  sendRequest(kPath);
 }
 
-void sendPosition(float x, float y, float z) {
-  std::string kPath = "/positions?x=" + std::to_string(x) + "&y=" + std::to_string(y) +
-                      "&z=" + std::to_string(z);
-  send(kPath);
+void sendPosition(float x, float y) {
+  std::string kPath = "/positions?x=" + std::to_string(x) + "&y=" + std::to_string(y);
+  sendRequest(kPath);
 }
 
 void setup() {
@@ -195,54 +219,50 @@ void setup() {
   if(myIMU.initialize(BASIC_SETTINGS))
     Serial.println("IMU settings loaded");
 
-  // init onboard screen
-  tft.begin();
-  tft.setRotation(0);
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextPadding(0);
-
   // init pose and biases
+  // position
   p.x = 0;
   p.y = 0;
-  p.z = 0;
   p.vy = 0;
+  p.vx = 0;
+  // drift velocities
+  p.driftVY = 0;
+  p.driftVX = 0;
+  // biases
   p.biasX = 0;
   p.biasY = 0;
-  p.biasZ = 0;
+  // degrees
   p.degX  = 0;
   p.degY = 0;
-  p.degZ = 0;
   prevCalAccY = 0;
+  prevCalAccX = 0;
   prevVelY = 0;
+  prevVelX = 0;
+  driftYCount = 0;
+  driftXCount = 0;
   
   // calibrate IMU
   Serial.println("The IMU will begin calibration, level the board and hold it still...");
   sleep(PRE_CAL_T);
   Serial.println("Calibrating IMU...");
   int count = 0;
-  while(millis() < CAL_T) {
+  int calibrationTimer = millis() + CAL_T;
+  while(millis() < calibrationTimer) {
     p.biasX += myIMU.readFloatAccelX();
     p.biasY += myIMU.readFloatAccelY();
-    p.biasZ += myIMU.readFloatAccelZ();
     count++;
   }
   p.biasX /= count;
   p.biasY /= count;
-  p.biasZ /= count;
   Serial.println("Calibration finished.");
   Serial.printf("acceleration x bias: %.2f\n", p.biasX);
   Serial.printf("acceleration y bias: %.2f\n", p.biasY);
-  Serial.printf("acceleration z bias: %.2f\n", p.biasZ);
   prevT = millis()/1000.0;
 
   // init buzzer
   pinMode(BUZZ_PIN, OUTPUT);
   buzzTimer = millis() + BUZZ_TIME;
   buzzerOn = false;
-  freqBuzz = millis();
-  buzz = false;
 }
 
 void loop() {
@@ -279,16 +299,17 @@ void loop() {
 
   // if phone was out of range consistently, buzz buzzer
   if(outRangeCount >= OUT_RANGE_COUNT_THRESHOLD) {
-    Serial.println("out of range: connected false");
+    //Serial.println("out of range: connected false");
     buzzerActivate();
     bleConnected = false;
     updatePose(currTime);
-    //sendPosition(p.x, p.y, p.z);
+    sendPosition(p.x, p.y);
   } else {
     digitalWrite(BUZZ_PIN, LOW);
   }
 
   if(blePrevConnected && !bleConnected) {
+    // async?
     sendBLEConnectionStatus("false");
   } else if(bleConnected && !blePrevConnected) {
     sendBLEConnectionStatus("true");
@@ -296,7 +317,4 @@ void loop() {
   
   blePrevConnected = bleConnected;
   prevT = currTime/1000.0;
-  // Serial.printf("acc: %.2f m/s^2 | vel: %.3f m/s | pos: %.2f cm\n", calAccY, p.vy, p.y*100);
-  //byte font = 6;
-  //tft.drawFloat(p.vy, 0, 60, font);
 }

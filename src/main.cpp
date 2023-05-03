@@ -1,9 +1,12 @@
 #include <Arduino.h>
 #include <TFT_eSPI.h>
+#include <WiFi.h>
+#include <HttpClient.h>
 #include "Wire.h"
 #include "SparkFunLSM6DSO.h"
 #include "../include/imu.h"
 #include <ArduinoBLE.h>
+#include <string>
 
 #define SERVICE_UUID        "307ba605-b5bf-437a-8f70-87fff5eb5f48"
 #define CHARACTERISTIC_UUID "4a5d39f9-256d-4fa0-9afb-97e61afb86fa"
@@ -15,6 +18,7 @@
 #define BUZZ_PIN 32
 #define BUZZ_TIME 250
 #define BUZZ_FREQ 0.5
+#define WIFI_SEARCH_DELAY 1000
 
 LSM6DSO myIMU;
 TFT_eSPI tft = TFT_eSPI();
@@ -23,6 +27,18 @@ BLEService batteryService(SERVICE_UUID);
 BLEUnsignedCharCharacteristic batteryLevelChar(CHARACTERISTIC_UUID, BLERead | BLENotify);
 BLEDevice central;
 
+// wifi vars
+char ssid[] = "Tell my wifi love her";
+char pass[] = "hmmmmmmm";
+const char kHostname[] = "3.101.68.31";
+std::string kPath;
+const int kNetworkDelay = 1000;
+float netAttemptTimer;
+WiFiClient c;
+HttpClient http(c);
+std::string bleConnectionStatus = "true";
+
+// imu pose vars
 float prevCalAccY;
 float prevVelY;
 float prevT;
@@ -81,6 +97,40 @@ void updatePos(float dt, float velY) {
   }
 }
 
+void send(std::string kPath) {
+  int err = 0;
+  WiFiClient c;
+  http = HttpClient(c);
+  err = http.put(kHostname, 5000, kPath.c_str());
+  if (err == 0) {
+    Serial.println("startedRequest ok");
+    err = http.responseStatusCode();
+    if (err >= 0) {
+      Serial.print("Got status code: ");
+      Serial.println(err);
+    } else {    
+      Serial.print("Getting response failed: ");
+      Serial.println(err);
+    }
+  } else {
+    Serial.print("Connect failed: ");
+    Serial.println(err);
+  }
+  http.stop();
+  netAttemptTimer = millis() + kNetworkDelay;
+}
+
+void sendBLEConnectionStatus(std::string connectionStatus) {
+  std::string kPath = "/connection?connected=" + connectionStatus;
+  send(kPath);
+}
+
+void sendPosition(float x, float y, float z) {
+  std::string kPath = "/positions?x=" + std::to_string(x) + "&y=" + std::to_string(y) +
+                      "&z=" + std::to_string(z);
+  send(kPath);
+}
+
 void setup() {
   Serial.begin(9600);
   Serial.println();
@@ -100,6 +150,21 @@ void setup() {
   Serial.println("Bluetooth device active, waiting for connections...");
   rssiTimer = millis() + BLE_SCAN_RATE;
   outRangeCount = 0;
+
+  // setup wifi
+  delay(kNetworkDelay);
+  Serial.print("\n\nConnecting to: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, pass);
+  while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+  Serial.println("MAC address: ");
+  Serial.println(WiFi.macAddress());
 
   // init IMU
   Serial.println("Initializing IMU...");
@@ -170,7 +235,7 @@ void loop() {
   while(!central.connected()){
     digitalWrite(BUZZ_PIN, LOW);
     central = BLE.central();
-    Serial.println("Waiting for BLE connection...");
+    sendConnectionStatus("false");
     delay(BLE_SCAN_RATE);
   }
 
@@ -188,7 +253,7 @@ void loop() {
   if(central) {
     if(time > rssiTimer && central.connected()){
       int rssi = BLE.rssi();
-      Serial.printf("RSSI val: %d\n", rssi);
+      //Serial.printf("RSSI val: %d\n", rssi);
       // if phone is out of range, count
       if(rssi < SIGNAL_STRENGTH_THRESHOLD) {
         outRangeCount++;
@@ -201,8 +266,13 @@ void loop() {
   // if phone was out of range consistently, buzz buzzer
   if(outRangeCount >= OUT_RANGE_COUNT_THRESHOLD) {
     buzzerActivate();
+    bleConnectionStatus = "false";
+    updateVel();
+    updatePos();
+    sendPosition(p.x, p.y, p.z);
   } else {
     digitalWrite(BUZZ_PIN, LOW);
+    bleConnectionStatus = "true";
   }
 
   // update pose values
@@ -215,4 +285,8 @@ void loop() {
   // Serial.printf("acc: %.2f m/s^2 | vel: %.3f m/s | pos: %.2f cm\n", calAccY, p.vy, p.y*100);
   //byte font = 6;
   //tft.drawFloat(p.vy, 0, 60, font);
+
+  if(millis() > netAttemptTimer) {
+    sendBLEConnectionStatus(bleConnectionStatus);
+  }
 }

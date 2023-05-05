@@ -1,11 +1,10 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <HttpClient.h>
+#include <ArduinoBLE.h>
 #include "Wire.h"
 #include "SparkFunLSM6DSO.h"
 #include "../include/imu.h"
-#include <ArduinoBLE.h>
-#include <string>
-#include <AsyncHTTPRequest_Generic.h>
 
 
 #define SERVICE_UUID        "307ba605-b5bf-437a-8f70-87fff5eb5f48"
@@ -29,9 +28,10 @@ BLEDevice central;
 // wifi vars
 char ssid[] = "Tell my wifi love her";
 char pass[] = "hmmmmmmm";
-const char kHostname[] = "54.215.244.83:5000";
+const char kHostname[] = "54.215.244.83";
 const int kNetworkDelay = 1000;
-AsyncHTTPRequest request;
+WiFiClient c;
+HttpClient http(c);
 
 bool bleConnected;
 bool blePrevConnected;
@@ -142,30 +142,29 @@ void updatePose(float currTime) {
   //Serial.printf("acc: %.2f m/s^2 | vel: %.3f m/s | pos: %.2f cm\n", calAccY, p.vy, p.y*100);
 }
 
+// thread routine
 void sendRequest(std::string kPath) {
-  delay(200);
-  static bool requestOpenResult;
-  if (request.readyState() == readyStateUnsent || request.readyState() == readyStateDone) {
-    requestOpenResult = request.open("PUT", (kHostname + kPath).c_str());
-    if (requestOpenResult) {
-      // Only send() if open() returns true, or crash
-      request.send();
-    } else {
-      Serial.println("Can't send, bad request");
+  int err = 0;
+  WiFiClient c;
+  http = HttpClient(c);
+  Serial.println("Bruh1");
+  err = http.put(kHostname, 5000, kPath.c_str());
+  Serial.println("Bruh2");
+  if (err == 0) {
+    Serial.println("startedRequest ok");
+    err = http.responseStatusCode();
+    if (err >= 0) {
+      Serial.print("Got status code: ");
+      Serial.println(err);
+    } else {    
+      Serial.print("Getting response failed: ");
+      Serial.println(err);
     }
   } else {
-    Serial.println("Can't send request");
+    Serial.print("Connect failed: ");
+    Serial.println(err);
   }
-}
-
-void sendBLEConnectionStatus(std::string connectionStatus) {
-  std::string kPath = "/connection?connected=" + connectionStatus;
-  sendRequest(kPath);
-}
-
-void sendPosition(float x, float y) {
-  std::string kPath = "/positions?x=" + std::to_string(x) + "&y=" + std::to_string(y);
-  sendRequest(kPath);
+  http.stop();
 }
 
 void setup() {
@@ -204,20 +203,20 @@ void setup() {
   Serial.println(WiFi.localIP());
   Serial.println("MAC address: ");
   Serial.println(WiFi.macAddress());
-  sendBLEConnectionStatus("false");
+  sendRequest("/connection?connected=false");
 
   // init IMU
   Serial.println("Initializing IMU...");
   Wire.begin();
   delay(10);
   if(myIMU.begin()) {
-    Serial.println("IMU ready.");
+    //Serial.println("IMU ready.");
   } else {
     Serial.println("Could not connect to IMU.");
     Serial.println("Freezing");
   }
   if(myIMU.initialize(BASIC_SETTINGS))
-    Serial.println("IMU settings loaded");
+    //Serial.println("IMU settings loaded");
 
   // init pose and biases
   // position
@@ -303,16 +302,16 @@ void loop() {
     buzzerActivate();
     bleConnected = false;
     updatePose(currTime);
-    sendPosition(p.x, p.y);
+    sendRequest("/position?x=" + std::to_string(p.x) + "&y=" + std::to_string(p.y));
   } else {
     digitalWrite(BUZZ_PIN, LOW);
   }
 
   if(blePrevConnected && !bleConnected) {
     // async?
-    sendBLEConnectionStatus("false");
+    sendRequest("/connection?connected=false");
   } else if(bleConnected && !blePrevConnected) {
-    sendBLEConnectionStatus("true");
+    sendRequest("/connection?connected=true");
   }
   
   blePrevConnected = bleConnected;

@@ -26,6 +26,8 @@ SHARED shared;
 BLEService service(SERVICE_UUID);
 BLEUnsignedCharCharacteristic characteristic(CHARACTERISTIC_UUID, BLERead | BLENotify);
 BLEDevice central;
+TaskHandle_t netOpHandle;
+SemaphoreHandle_t mutex;
 
 bool bleConnected;
 bool blePrevConnected;
@@ -139,7 +141,7 @@ void updatePose(float currTime) {
 void sendRequest(std::string kPath) {
   WiFiClient c;
   HttpClient http = HttpClient(c);
-  const char kHostname[] = "54.215.244.83";
+  const char kHostname[] = "54.183.176.9";
   int err = http.put(kHostname, 5000, kPath.c_str());
   if (err == 0) {
     Serial.println("startedRequest ok");
@@ -161,17 +163,19 @@ void sendRequest(std::string kPath) {
 // thread routine
 void networkOperations(void *dataPtr) {
   SHARED *shared = (SHARED *) dataPtr;
+  float x = 0;
+  float y = 0;
   // wifi vars
   char ssid[] = "Tell my wifi love her";
   char pass[] = "hmmmmmmm";
-  const int kNetworkDelay = 500;
+  const int kNetworkDelay = 750;
   // setup wifi
-  delay(kNetworkDelay);
+  vTaskDelay(pdMS_TO_TICKS(kNetworkDelay));
   Serial.print("\n\nConnecting to: ");
-  Serial.println(ssid);
+  //Serial.println(ssid);
   WiFi.begin(ssid, pass);
   while (WiFi.status() != WL_CONNECTED) {
-      delay(500);
+      vTaskDelay(pdMS_TO_TICKS(kNetworkDelay));
       Serial.print(".");
   }
   Serial.println("\nWiFi connected");
@@ -180,12 +184,18 @@ void networkOperations(void *dataPtr) {
   Serial.println("MAC address: ");
   Serial.println(WiFi.macAddress());
   while(1) {
-    delay(kNetworkDelay);
+    vTaskDelay(pdMS_TO_TICKS(kNetworkDelay));
     if(shared->connected) {
       sendRequest("/connection?connected=true");
     } else {
+      if(xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE) {
+        x = shared->x;
+        y = shared->y;
+        xSemaphoreGive(mutex);
+      }
+      Serial.printf(("shared pos: " + std::to_string(x) + " " + std::to_string(y) + "\n").c_str());
       sendRequest("/connection?connected=false");
-      sendRequest("/position?x=" + std::to_string(shared->x) + "&y=" + std::to_string(shared->y));
+      sendRequest("/position?x=" + std::to_string(x) + "&y=" + std::to_string(y) + "&z=0");
     }
   }
 }
@@ -212,13 +222,10 @@ void setup() {
   bleConnected = false;
   blePrevConnected = false;
 
-  // create network thread
-  xTaskCreate(networkOperations, "networkOperations", 5000, &shared, 2, NULL);
-
   // init IMU
   Serial.println("Initializing IMU...");
   Wire.begin();
-  delay(10);
+  vTaskDelay(pdMS_TO_TICKS(10));
   if(myIMU.begin()) {
     //Serial.println("IMU ready.");
   } else {
@@ -249,6 +256,13 @@ void setup() {
   prevVelX = 0;
   driftYCount = 0;
   driftXCount = 0;
+
+  // create network thread
+  shared.x = p.x;
+  shared.y = p.y;
+  shared.connected = bleConnected;
+  mutex = xSemaphoreCreateMutex();
+  xTaskCreate(networkOperations, "networkOperations", 5000, &shared, 2, &netOpHandle);
   
   // calibrate IMU
   Serial.println("The IMU will begin calibration, level the board and hold it still...");
@@ -296,7 +310,7 @@ void loop() {
   // get RSSI value & count weak signal strength instances
   if(bleConnected && currTime > rssiTimer) {
     int rssi = BLE.rssi();
-    Serial.printf("RSSI val: %d\n", rssi);
+    //Serial.printf("RSSI val: %d\n", rssi);
     // if phone is out of range, count
     if(rssi < SIGNAL_STRENGTH_THRESHOLD) {
       outRangeCount++;
@@ -313,8 +327,11 @@ void loop() {
     bleConnected = false;
     updatePose(currTime);
     // exchange with shared data
-    shared.x = p.x;
-    shared.y = p.y;
+    if(xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE) {
+      shared.x = p.x;
+      shared.y = p.y;
+      xSemaphoreGive(mutex);
+    }
   } else {
     digitalWrite(BUZZ_PIN, LOW);
   }

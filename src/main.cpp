@@ -4,7 +4,8 @@
 #include <ArduinoBLE.h>
 #include "Wire.h"
 #include "SparkFunLSM6DSO.h"
-#include "../include/imu.h"
+#include "imu.h"
+#include "shared.h"
 
 
 #define SERVICE_UUID        "307ba605-b5bf-437a-8f70-87fff5eb5f48"
@@ -21,17 +22,10 @@
 
 LSM6DSO myIMU;
 IMU_Vals p;
+SHARED shared;
 BLEService service(SERVICE_UUID);
 BLEUnsignedCharCharacteristic characteristic(CHARACTERISTIC_UUID, BLERead | BLENotify);
 BLEDevice central;
-
-// wifi vars
-char ssid[] = "Tell my wifi love her";
-char pass[] = "hmmmmmmm";
-const char kHostname[] = "54.215.244.83";
-const int kNetworkDelay = 1000;
-WiFiClient c;
-HttpClient http(c);
 
 bool bleConnected;
 bool blePrevConnected;
@@ -142,14 +136,11 @@ void updatePose(float currTime) {
   //Serial.printf("acc: %.2f m/s^2 | vel: %.3f m/s | pos: %.2f cm\n", calAccY, p.vy, p.y*100);
 }
 
-// thread routine
 void sendRequest(std::string kPath) {
-  int err = 0;
   WiFiClient c;
-  http = HttpClient(c);
-  Serial.println("Bruh1");
-  err = http.put(kHostname, 5000, kPath.c_str());
-  Serial.println("Bruh2");
+  HttpClient http = HttpClient(c);
+  const char kHostname[] = "54.215.244.83";
+  int err = http.put(kHostname, 5000, kPath.c_str());
   if (err == 0) {
     Serial.println("startedRequest ok");
     err = http.responseStatusCode();
@@ -165,6 +156,38 @@ void sendRequest(std::string kPath) {
     Serial.println(err);
   }
   http.stop();
+}
+
+// thread routine
+void networkOperations(void *dataPtr) {
+  SHARED *shared = (SHARED *) dataPtr;
+  // wifi vars
+  char ssid[] = "Tell my wifi love her";
+  char pass[] = "hmmmmmmm";
+  const int kNetworkDelay = 500;
+  // setup wifi
+  delay(kNetworkDelay);
+  Serial.print("\n\nConnecting to: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, pass);
+  while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+  Serial.println("MAC address: ");
+  Serial.println(WiFi.macAddress());
+  while(1) {
+    delay(kNetworkDelay);
+    if(shared->connected) {
+      sendRequest("/connection?connected=true");
+    } else {
+      sendRequest("/connection?connected=false");
+      sendRequest("/position?x=" + std::to_string(shared->x) + "&y=" + std::to_string(shared->y));
+    }
+  }
 }
 
 void setup() {
@@ -189,21 +212,8 @@ void setup() {
   bleConnected = false;
   blePrevConnected = false;
 
-  // setup wifi
-  delay(kNetworkDelay);
-  Serial.print("\n\nConnecting to: ");
-  Serial.println(ssid);
-  WiFi.begin(ssid, pass);
-  while (WiFi.status() != WL_CONNECTED) {
-      delay(500);
-      Serial.print(".");
-  }
-  Serial.println("\nWiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
-  Serial.println("MAC address: ");
-  Serial.println(WiFi.macAddress());
-  sendRequest("/connection?connected=false");
+  // create network thread
+  xTaskCreate(networkOperations, "networkOperations", 5000, &shared, 2, NULL);
 
   // init IMU
   Serial.println("Initializing IMU...");
@@ -302,16 +312,18 @@ void loop() {
     buzzerActivate();
     bleConnected = false;
     updatePose(currTime);
-    sendRequest("/position?x=" + std::to_string(p.x) + "&y=" + std::to_string(p.y));
+    // exchange with shared data
+    shared.x = p.x;
+    shared.y = p.y;
   } else {
     digitalWrite(BUZZ_PIN, LOW);
   }
 
   if(blePrevConnected && !bleConnected) {
-    // async?
-    sendRequest("/connection?connected=false");
+    // exchange with shared data
+    shared.connected = false;
   } else if(bleConnected && !blePrevConnected) {
-    sendRequest("/connection?connected=true");
+    shared.connected = true;
   }
   
   blePrevConnected = bleConnected;
